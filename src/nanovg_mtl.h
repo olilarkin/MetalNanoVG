@@ -50,6 +50,12 @@ enum NVGcreateFlags {
 // These are additional flags on top of NVGimageFlags.
 enum NVGimageFlagsMetal {
   NVG_IMAGE_NODELETE = 1 << 16, // Do not delete Metal texture handle.
+  // Creates the Metal texture with render-target usage. Set automatically by
+  // mnvgCreateFramebuffer(); set it yourself only if you obtain the texture
+  // via mnvgImageHandle() and render into it with your own render passes.
+  // Plain images are created with shader-read usage only, which allows the
+  // GPU to keep them in its compressed fast path.
+  NVG_IMAGE_RENDER_TARGET = 1 << 17,
 };
 
 // The possible OS targets.

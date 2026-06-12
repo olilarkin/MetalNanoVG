@@ -541,7 +541,8 @@ MNVGframebuffer* mnvgCreateFramebuffer(NVGcontext* ctx, int width,
 
   memset(framebuffer, 0, sizeof(MNVGframebuffer));
   framebuffer->image = nvgCreateImageRGBA(ctx, width, height,
-                                          imageFlags | NVG_IMAGE_PREMULTIPLIED,
+                                          imageFlags | NVG_IMAGE_PREMULTIPLIED
+                                              | NVG_IMAGE_RENDER_TARGET,
                                           NULL);
   framebuffer->ctx = ctx;
   return framebuffer;
@@ -1226,9 +1227,14 @@ enum MNVGTarget mnvgTarget() {
       width:width
       height:height
       mipmapped:(imageFlags & NVG_IMAGE_GENERATE_MIPMAPS ? YES : NO)];
-  textureDescriptor.usage = MTLTextureUsageShaderRead
-                            | MTLTextureUsageRenderTarget
-                            | MTLTextureUsageShaderWrite;
+  // Plain images only ever get sampled; declaring write usages they don't
+  // need would make the GPU keep them out of its lossless-compressed fast
+  // path. Render-target usage is added only for framebuffer textures (see
+  // NVG_IMAGE_RENDER_TARGET in nanovg_mtl.h).
+  textureDescriptor.usage = MTLTextureUsageShaderRead;
+  if (imageFlags & NVG_IMAGE_RENDER_TARGET) {
+    textureDescriptor.usage |= MTLTextureUsageRenderTarget;
+  }
 #if TARGET_OS_SIMULATOR
   textureDescriptor.storageMode = MTLStorageModePrivate;
 #endif  // TARGET_OS_SIMULATOR
