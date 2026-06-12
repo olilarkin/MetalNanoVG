@@ -110,13 +110,35 @@ struct MNVGfragUniforms {
 };
 typedef struct MNVGfragUniforms MNVGfragUniforms;
 
+// Texture ids encode the index of the texture in `textures` so lookups are
+// O(1): bits 0..15 hold the index and bits 16..30 hold a per-slot generation
+// (1..0x7FFF, never 0) that is bumped every time a slot is (re)allocated, so
+// stale ids of deleted textures fail to resolve. Ids stay positive and
+// non-zero, and remain opaque to nanovg and to users.
+enum {
+  MNVG_TEXTURE_INDEX_BITS = 16,
+  MNVG_TEXTURE_INDEX_MASK = (1 << MNVG_TEXTURE_INDEX_BITS) - 1,
+  MNVG_TEXTURE_GENERATION_MASK = 0x7FFF,
+};
+
 @interface MNVGtexture : NSObject {
  @public
   int id;
   int type;
   int flags;
+  int generation;
   id<MTLTexture> tex;
   id<MTLSamplerState> sampler;
+}
+@end
+
+// Holds the pair of pipeline states created for one (blend func, pixel format)
+// combination, so pipeline states are compiled at most once per combination
+// for the lifetime of the context.
+@interface MNVGpipelineCacheEntry : NSObject {
+ @public
+  id<MTLRenderPipelineState> pipelineState;
+  id<MTLRenderPipelineState> stencilOnlyPipelineState;
 }
 @end
 
@@ -160,7 +182,6 @@ typedef struct MNVGfragUniforms MNVGfragUniforms;
 
 // Textures
 @property (nonatomic, strong) NSMutableArray<MNVGtexture*>* textures;
-@property int textureId;
 
 // Per frame buffers
 @property (nonatomic, assign) MNVGbuffers* buffers;
@@ -185,6 +206,17 @@ typedef struct MNVGfragUniforms MNVGfragUniforms;
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
 @property (nonatomic, strong) id<MTLRenderPipelineState>
     stencilOnlyPipelineState;
+@property (nonatomic, strong)
+    NSMutableDictionary<NSNumber*, MNVGpipelineCacheEntry*>* pipelineCache;
+
+// Shadows of the state currently bound on `renderEncoder`, used to skip
+// redundant encoder calls. Non-owning: every pipeline state is kept alive by
+// `pipelineCache` and every depth-stencil state by the properties above for
+// the lifetime of the context. Valid only while `renderEncoder` is alive;
+// reset whenever a new encoder is created.
+@property (nonatomic, assign) void* lastPipelineState;
+@property (nonatomic, assign) void* lastDepthStencilState;
+@property (nonatomic, assign) int lastBoundImage;
 @property (nonatomic, strong) id<MTLSamplerState> pseudoSampler;
 @property (nonatomic, strong) id<MTLTexture> pseudoTexture;
 @property (nonatomic, strong) MTLVertexDescriptor* vertexDescriptor;
@@ -708,18 +740,23 @@ enum MNVGTarget mnvgTarget() {
 
 - (MNVGtexture*)allocTexture {
   MNVGtexture* tex = nil;
+  int index = 0;
 
   for (MNVGtexture* texture in _textures) {
     if (texture->id == 0) {
       tex = texture;
       break;
     }
+    index++;
   }
   if (tex == nil) {
+    if (_textures.count > MNVG_TEXTURE_INDEX_MASK) return nil;
     tex = [MNVGtexture new];
+    index = (int)_textures.count;
     [_textures addObject:tex];
   }
-  tex->id = ++_textureId;
+  tex->generation = (tex->generation % MNVG_TEXTURE_GENERATION_MASK) + 1;
+  tex->id = (tex->generation << MNVG_TEXTURE_INDEX_BITS) | index;
   return tex;
 }
 
@@ -836,7 +873,7 @@ enum MNVGTarget mnvgTarget() {
 - (void)convexFill:(MNVGcall*)call {
   const int kIndexBufferOffset = call->indexOffset * _indexSize;
   [self setUniforms:call->uniformOffset image:call->image];
-  [_renderEncoder setRenderPipelineState:_pipelineState];
+  [self bindPipelineState:_pipelineState];
   if (call->indexCount > 0) {
     [_renderEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                indexCount:call->indexCount
@@ -857,8 +894,8 @@ enum MNVGTarget mnvgTarget() {
   // Draws shapes.
   const int kIndexBufferOffset = call->indexOffset * _indexSize;
   [_renderEncoder setCullMode:MTLCullModeNone];
-  [_renderEncoder setDepthStencilState:_fillShapeStencilState];
-  [_renderEncoder setRenderPipelineState:_stencilOnlyPipelineState];
+  [self bindDepthStencilState:_fillShapeStencilState];
+  [self bindPipelineState:_stencilOnlyPipelineState];
   if (call->indexCount > 0) {
     [_renderEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                indexCount:call->indexCount
@@ -869,31 +906,30 @@ enum MNVGTarget mnvgTarget() {
 
   // Restores states.
   [_renderEncoder setCullMode:MTLCullModeBack];
-  [_renderEncoder setRenderPipelineState:_pipelineState];
+  [self bindPipelineState:_pipelineState];
 
   // Draws anti-aliased fragments.
   [self setUniforms:call->uniformOffset image:call->image];
   if (_flags & NVG_ANTIALIAS && call->strokeCount > 0) {
-    [_renderEncoder setDepthStencilState:_fillAntiAliasStencilState];
+    [self bindDepthStencilState:_fillAntiAliasStencilState];
     [_renderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                        vertexStart:call->strokeOffset
                        vertexCount:call->strokeCount];
   }
 
   // Draws fill.
-  [_renderEncoder setDepthStencilState:_fillStencilState];
+  [self bindDepthStencilState:_fillStencilState];
   [_renderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                      vertexStart:call->triangleOffset
                      vertexCount:call->triangleCount];
-  [_renderEncoder setDepthStencilState:_defaultStencilState];
+  [self bindDepthStencilState:_defaultStencilState];
 }
 
 - (MNVGtexture*)findTexture:(int)id {
-  for (MNVGtexture* texture in _textures) {
-    if (texture->id == id)
-      return texture;
-  }
-  return nil;
+  const int index = id & MNVG_TEXTURE_INDEX_MASK;
+  if (id <= 0 || index >= (int)_textures.count) return nil;
+  MNVGtexture* texture = _textures[index];
+  return (texture->id == id) ? texture : nil;
 }
 
 - (MNVGfragUniforms*)fragUniformAtIndex:(int)index {
@@ -949,6 +985,11 @@ enum MNVGTarget mnvgTarget() {
                   atIndex:MNVG_VERTEX_INPUT_INDEX_VIEW_SIZE];
 
   [encoder setFragmentBuffer:_buffers.uniformBuffer offset:0 atIndex:0];
+
+  // A fresh encoder has no state bound; reset the encoder state shadows.
+  _lastPipelineState = NULL;
+  _lastDepthStencilState = NULL;
+  _lastBoundImage = -1;
   return encoder;
 }
 
@@ -1048,7 +1089,6 @@ enum MNVGTarget mnvgTarget() {
   _vertexDescriptor.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
 
   // Initialzes textures.
-  _textureId = 0;
   _textures = [NSMutableArray array];
 
   // Initializes default sampler descriptor.
@@ -1067,6 +1107,9 @@ enum MNVGTarget mnvgTarget() {
     MNVGtexture* tex = [self findTexture:kPseudoTextureImage];
     _pseudoTexture = tex->tex;
   }
+
+  // Initializes pipeline state cache.
+  _pipelineCache = [NSMutableDictionary dictionary];
 
   // Initializes default blend states.
   _blendFunc = malloc(sizeof(MNVGblend));
@@ -1301,6 +1344,7 @@ enum MNVGTarget mnvgTarget() {
   _vertexFunction = nil;
   _pipelineState = nil;
   _stencilOnlyPipelineState = nil;
+  _pipelineCache = nil;
   _pseudoSampler = nil;
   _pseudoTexture = nil;
   _vertexDescriptor = nil;
@@ -1309,19 +1353,16 @@ enum MNVGTarget mnvgTarget() {
 }
 
 - (int)renderDeleteTexture:(int)image {
-  for (MNVGtexture* texture in _textures) {
-    if (texture->id == image) {
-      if (texture->tex != nil &&
-          (texture->flags & NVG_IMAGE_NODELETE) == 0) {
-        texture->tex = nil;
-        texture->sampler = nil;
-      }
-      texture->id = 0;
-      texture->flags = 0;
-      return 1;
-    }
+  MNVGtexture* texture = [self findTexture:image];
+  if (texture == nil) return 0;
+  if (texture->tex != nil &&
+      (texture->flags & NVG_IMAGE_NODELETE) == 0) {
+    texture->tex = nil;
+    texture->sampler = nil;
   }
-  return 0;
+  texture->id = 0;
+  texture->flags = 0;
+  return 1;
 }
 
 - (void)renderFillWithPaint:(NVGpaint*)paint
@@ -1463,11 +1504,12 @@ error:
   if (_renderEncoder == nil) {
     return;
   }
+  const MTLPixelFormat pixelFormat = colorTexture.pixelFormat;
   MNVGcall* call = &buffers.calls[0];
   for (int i = buffers.ncalls; i--; ++call) {
     MNVGblend* blend = &call->blendFunc;
     [self updateRenderPipelineStatesForBlend:blend
-                                 pixelFormat:colorTexture.pixelFormat];
+                                 pixelFormat:pixelFormat];
 
     if (call->type == MNVG_FILL)
       [self fill:call];
@@ -1712,10 +1754,24 @@ error:
   viewSize[1] = height;
 }
 
+- (void)bindPipelineState:(id<MTLRenderPipelineState>)state {
+  if ((__bridge void*)state == _lastPipelineState) return;
+  [_renderEncoder setRenderPipelineState:state];
+  _lastPipelineState = (__bridge void*)state;
+}
+
+- (void)bindDepthStencilState:(id<MTLDepthStencilState>)state {
+  if ((__bridge void*)state == _lastDepthStencilState) return;
+  [_renderEncoder setDepthStencilState:state];
+  _lastDepthStencilState = (__bridge void*)state;
+}
+
 - (void)setUniforms:(int)uniformOffset image:(int)image {
   [_renderEncoder setFragmentBufferOffset:uniformOffset atIndex:0];
 
   MNVGtexture* tex = (image == 0 ? nil : [self findTexture:image]);
+  const int effectiveImage = (tex == nil ? 0 : image);
+  if (effectiveImage == _lastBoundImage) return;
   if (tex != nil) {
     [_renderEncoder setFragmentTexture:tex->tex atIndex:0];
     [_renderEncoder setFragmentSamplerState:tex->sampler atIndex:0];
@@ -1723,6 +1779,7 @@ error:
     [_renderEncoder setFragmentTexture:_pseudoTexture atIndex:0];
     [_renderEncoder setFragmentSamplerState:_pseudoSampler atIndex:0];
   }
+  _lastBoundImage = effectiveImage;
 }
 
 - (void)stroke:(MNVGcall*)call {
@@ -1733,30 +1790,30 @@ error:
   if (_flags & NVG_STENCIL_STROKES) {
     // Fills the stroke base without overlap.
     [self setUniforms:(call->uniformOffset + _fragSize) image:call->image];
-    [_renderEncoder setDepthStencilState:_strokeShapeStencilState];
-    [_renderEncoder setRenderPipelineState:_pipelineState];
+    [self bindDepthStencilState:_strokeShapeStencilState];
+    [self bindPipelineState:_pipelineState];
     [_renderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                        vertexStart:call->strokeOffset
                        vertexCount:call->strokeCount];
 
     // Draws anti-aliased fragments.
     [self setUniforms:call->uniformOffset image:call->image];
-    [_renderEncoder setDepthStencilState:_strokeAntiAliasStencilState];
+    [self bindDepthStencilState:_strokeAntiAliasStencilState];
     [_renderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                        vertexStart:call->strokeOffset
                        vertexCount:call->strokeCount];
 
     // Clears stencil buffer.
-    [_renderEncoder setDepthStencilState:_strokeClearStencilState];
-    [_renderEncoder setRenderPipelineState:_stencilOnlyPipelineState];
+    [self bindDepthStencilState:_strokeClearStencilState];
+    [self bindPipelineState:_stencilOnlyPipelineState];
     [_renderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                        vertexStart:call->strokeOffset
                        vertexCount:call->strokeCount];
-    [_renderEncoder setDepthStencilState:_defaultStencilState];
+    [self bindDepthStencilState:_defaultStencilState];
   } else {
     // Draws strokes.
     [self setUniforms:call->uniformOffset image:call->image];
-    [_renderEncoder setRenderPipelineState:_pipelineState];
+    [self bindPipelineState:_pipelineState];
     [_renderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                        vertexStart:call->strokeOffset
                        vertexCount:call->strokeCount];
@@ -1765,7 +1822,7 @@ error:
 
 - (void)triangles:(MNVGcall*)call {
   [self setUniforms:call->uniformOffset image:call->image];
-  [_renderEncoder setRenderPipelineState:_pipelineState];
+  [self bindPipelineState:_pipelineState];
   [_renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                      vertexStart:call->triangleOffset
                      vertexCount:call->triangleCount];
@@ -1780,6 +1837,22 @@ error:
       _blendFunc->dstRGB == blend->dstRGB &&
       _blendFunc->srcAlpha == blend->srcAlpha &&
       _blendFunc->dstAlpha == blend->dstAlpha) {
+    return;
+  }
+
+  // Checks the pipeline state cache before creating new pipeline states.
+  // MTLBlendFactor values fit in 8 bits and MTLPixelFormat in 32 bits.
+  const uint64_t pipelineKey = ((uint64_t)pixelFormat << 32) |
+                               ((uint64_t)blend->srcRGB << 24) |
+                               ((uint64_t)blend->dstRGB << 16) |
+                               ((uint64_t)blend->srcAlpha << 8) |
+                               ((uint64_t)blend->dstAlpha);
+  MNVGpipelineCacheEntry* cacheEntry = _pipelineCache[@(pipelineKey)];
+  if (cacheEntry != nil) {
+    _pipelineState = cacheEntry->pipelineState;
+    _stencilOnlyPipelineState = cacheEntry->stencilOnlyPipelineState;
+    *_blendFunc = *blend;
+    _piplelinePixelFormat = pixelFormat;
     return;
   }
 
@@ -1819,6 +1892,13 @@ error:
   [self checkError:error withMessage:"init pipeline stencil only state"];
 
   _piplelinePixelFormat = pixelFormat;
+
+  if (_pipelineState != nil && _stencilOnlyPipelineState != nil) {
+    cacheEntry = [MNVGpipelineCacheEntry new];
+    cacheEntry->pipelineState = _pipelineState;
+    cacheEntry->stencilOnlyPipelineState = _stencilOnlyPipelineState;
+    _pipelineCache[@(pipelineKey)] = cacheEntry;
+  }
 }
 
 // Re-creates stencil texture whenever the specified size is bigger.
@@ -1846,4 +1926,7 @@ error:
 @end
 
 @implementation MNVGtexture
+@end
+
+@implementation MNVGpipelineCacheEntry
 @end
