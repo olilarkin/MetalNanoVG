@@ -1915,9 +1915,20 @@ error:
         height:size->y
         mipmapped:NO];
     stencilTextureDescriptor.usage = MTLTextureUsageRenderTarget;
-#if TARGET_OS_OSX || TARGET_OS_SIMULATOR || TARGET_OS_MACCATALYST
+
+    // The stencil texture is cleared on load and discarded on store
+    // (see renderCommandEncoderWithColorTexture:), and is never sampled, so
+    // it does not need a CPU-visible allocation. On tile-based Apple GPUs it
+    // can live entirely in tile memory, which removes its system-memory
+    // footprint and write bandwidth.
     stencilTextureDescriptor.storageMode = MTLStorageModePrivate;
-#endif  // TARGET_OS_OSX || TARGET_OS_SIMULATOR || TARGET_OS_MACCATALYST
+#if !TARGET_OS_SIMULATOR
+    if (@available(macOS 11.0, iOS 13.0, tvOS 13.0, *)) {
+      if ([_metalLayer.device supportsFamily:MTLGPUFamilyApple1]) {
+        stencilTextureDescriptor.storageMode = MTLStorageModeMemoryless;
+      }
+    }
+#endif  // !TARGET_OS_SIMULATOR
     _buffers.stencilTexture = [_metalLayer.device
         newTextureWithDescriptor:stencilTextureDescriptor];
   }
