@@ -821,8 +821,10 @@ enum MNVGTarget mnvgTarget() {
     frag->scissorMat = matrix_from_rows((vector_float3){0, 0, 0},
                                         (vector_float3){0, 0, 0},
                                         (vector_float3){0, 0, 0});
-    frag->scissorExt.x = 1.0f;
-    frag->scissorExt.y = 1.0f;
+    // Negative extent tells scissorMask() in the shader to skip the scissor
+    // computation entirely.
+    frag->scissorExt.x = -1.0f;
+    frag->scissorExt.y = -1.0f;
     frag->scissorScale.x = 1.0f;
     frag->scissorScale.y = 1.0f;
   } else {

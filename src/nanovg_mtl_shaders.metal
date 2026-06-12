@@ -58,6 +58,10 @@ float sdroundrect(constant Uniforms& uniforms, float2 pt);
 float strokeMask(constant Uniforms& uniforms, float2 ftcoord);
 
 float scissorMask(constant Uniforms& uniforms, float2 p) {
+  // A negative scissorExt marks "no scissor set" (see convertPaintForFrag);
+  // the full computation below would also yield exactly 1.0 in that case.
+  if (uniforms.scissorExt.x < 0.0f)
+    return 1.0f;
   float2 sc = (abs((uniforms.scissorMat * float3(p, 1.0f)).xy)
                   - uniforms.scissorExt) \
               * uniforms.scissorScale;
