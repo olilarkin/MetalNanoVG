@@ -46,10 +46,11 @@ execute_cmd() {
   HEADER_NAME="$PREFIX/$TARGET$SUFFIX.h"
   VARIABLE_NAME="$PREFIX/$TARGET$SUFFIX"
 
+  # Metal 1.2 (iOS 10 / macOS 10.12) is required for function constants.
   if [ $SDK = "iphoneos" ]; then
-    CMD="$CMD -mios-version-min=8.0"
+    CMD="$CMD -mios-version-min=10.0"
   elif [ $SDK = "macosx" ]; then
-    CMD="$CMD -mmacosx-version-min=10.11"
+    CMD="$CMD -mmacosx-version-min=10.12"
   fi
 
   CMD="$CMD -o $AIR_FILE_NAME"

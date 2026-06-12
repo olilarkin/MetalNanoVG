@@ -89,6 +89,10 @@ struct MNVGcall {
   int strokeOffset;
   int strokeCount;
   int uniformOffset;
+  // Shader variant (type * 3 + texType) of the call's fragment uniforms,
+  // recorded at call-creation time. The flush loop must not read it back
+  // from the uniform buffer, whose memory is write-combined.
+  int variant;
   MNVGblend blendFunc;
 };
 typedef struct MNVGcall MNVGcall;
@@ -129,16 +133,6 @@ enum {
   int generation;
   id<MTLTexture> tex;
   id<MTLSamplerState> sampler;
-}
-@end
-
-// Holds the pair of pipeline states created for one (blend func, pixel format)
-// combination, so pipeline states are compiled at most once per combination
-// for the lifetime of the context.
-@interface MNVGpipelineCacheEntry : NSObject {
- @public
-  id<MTLRenderPipelineState> pipelineState;
-  id<MTLRenderPipelineState> stencilOnlyPipelineState;
 }
 @end
 
@@ -200,14 +194,20 @@ enum {
 @property (nonatomic, strong) id<MTLDepthStencilState>
     strokeAntiAliasStencilState;
 @property (nonatomic, strong) id<MTLDepthStencilState> strokeClearStencilState;
+@property (nonatomic, strong) id<MTLLibrary> library;
 @property (nonatomic, strong) id<MTLFunction> fragmentFunction;
 @property (nonatomic, strong) id<MTLFunction> vertexFunction;
+@property (nonatomic, strong)
+    NSMutableDictionary<NSNumber*, id<MTLFunction>>* fragmentFunctionCache;
 @property MTLPixelFormat piplelinePixelFormat;
+@property int pipelineVariant;
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
 @property (nonatomic, strong) id<MTLRenderPipelineState>
     stencilOnlyPipelineState;
-@property (nonatomic, strong)
-    NSMutableDictionary<NSNumber*, MNVGpipelineCacheEntry*>* pipelineCache;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber*,
+    id<MTLRenderPipelineState>>* pipelineCache;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber*,
+    id<MTLRenderPipelineState>>* stencilOnlyPipelineCache;
 
 // Shadows of the state currently bound on `renderEncoder`, used to skip
 // redundant encoder calls. Non-owning: every pipeline state is kept alive by
@@ -288,7 +288,8 @@ enum {
 - (void)triangles:(MNVGcall*)call;
 
 - (void)updateRenderPipelineStatesForBlend:(MNVGblend*)blend
-                               pixelFormat:(MTLPixelFormat)pixelFormat;
+                               pixelFormat:(MTLPixelFormat)pixelFormat
+                                   variant:(int)variant;
 
 @end
 
@@ -808,9 +809,12 @@ enum MNVGTarget mnvgTarget() {
                    scissor:(NVGscissor*)scissor
                      width:(float)width
                     fringe:(float)fringe
-                 strokeThr:(float)strokeThr {
+                 strokeThr:(float)strokeThr
+                   variant:(int*)variant {
   MNVGtexture* tex = nil;
   float invxform[6];
+  int type;
+  int texType = 0;
 
   memset(frag, 0, sizeof(*frag));
 
@@ -855,18 +859,21 @@ enum MNVGTarget mnvgTarget() {
     } else {
       nvgTransformInverse(invxform, paint->xform);
     }
-    frag->type = MNVG_SHADER_FILLIMG;
+    type = MNVG_SHADER_FILLIMG;
 
     if (tex->type == NVG_TEXTURE_RGBA)
-      frag->texType = (tex->flags & NVG_IMAGE_PREMULTIPLIED) ? 0 : 1;
+      texType = (tex->flags & NVG_IMAGE_PREMULTIPLIED) ? 0 : 1;
     else
-      frag->texType = 2;
+      texType = 2;
   } else {
-    frag->type = MNVG_SHADER_FILLGRAD;
+    type = MNVG_SHADER_FILLGRAD;
     frag->radius = paint->radius;
     frag->feather = paint->feather;
     nvgTransformInverse(invxform, paint->xform);
   }
+  frag->type = type;
+  frag->texType = texType;
+  if (variant != NULL) *variant = type * 3 + texType;
 
   mtlnvg__xformToMat3x3(&frag->paintMat, invxform);
 
@@ -1054,6 +1061,10 @@ enum MNVGTarget mnvgTarget() {
     return 0;
   }
 
+  // The library is kept to create specialized fragment functions on demand;
+  // `_fragmentFunction` is the unspecialized fallback.
+  _library = library;
+  _fragmentFunctionCache = [NSMutableDictionary dictionary];
   _vertexFunction = [library newFunctionWithName:@"vertexShader"];
   if (_flags & NVG_ANTIALIAS) {
     _fragmentFunction = [library newFunctionWithName:@"fragmentShaderAA"];
@@ -1111,8 +1122,10 @@ enum MNVGTarget mnvgTarget() {
     _pseudoTexture = tex->tex;
   }
 
-  // Initializes pipeline state cache.
+  // Initializes pipeline state caches.
   _pipelineCache = [NSMutableDictionary dictionary];
+  _stencilOnlyPipelineCache = [NSMutableDictionary dictionary];
+  _pipelineVariant = -1;
 
   // Initializes default blend states.
   _blendFunc = malloc(sizeof(MNVGblend));
@@ -1353,6 +1366,9 @@ enum MNVGTarget mnvgTarget() {
   _pipelineState = nil;
   _stencilOnlyPipelineState = nil;
   _pipelineCache = nil;
+  _stencilOnlyPipelineCache = nil;
+  _fragmentFunctionCache = nil;
+  _library = nil;
   _pseudoSampler = nil;
   _pseudoTexture = nil;
   _vertexDescriptor = nil;
@@ -1456,7 +1472,8 @@ enum MNVGTarget mnvgTarget() {
                     scissor:scissor
                       width:fringe
                      fringe:fringe
-                  strokeThr:-1.0f];
+                  strokeThr:-1.0f
+                    variant:&call->variant];
   return;
 
 error:
@@ -1517,7 +1534,8 @@ error:
   for (int i = buffers.ncalls; i--; ++call) {
     MNVGblend* blend = &call->blendFunc;
     [self updateRenderPipelineStatesForBlend:blend
-                                 pixelFormat:pixelFormat];
+                                 pixelFormat:pixelFormat
+                                     variant:call->variant];
 
     if (call->type == MNVG_FILL)
       [self fill:call];
@@ -1610,15 +1628,18 @@ error:
                       scissor:scissor
                         width:strokeWidth
                        fringe:fringe
-                    strokeThr:-1.0f];
+                    strokeThr:-1.0f
+                      variant:&call->variant];
     MNVGfragUniforms* frag = [self
         fragUniformAtIndex:call->uniformOffset + _fragSize];
+    // Same paint and scissor, so the variant is the same as above.
     [self convertPaintForFrag:frag
                         paint:paint
                       scissor:scissor
                         width:strokeWidth
                        fringe:fringe
-                    strokeThr:(1.0f - 0.5f / 255.0f)];
+                    strokeThr:(1.0f - 0.5f / 255.0f)
+                      variant:NULL];
   } else {
     // Fill shader
     call->uniformOffset = [self allocFragUniforms:1];
@@ -1628,7 +1649,8 @@ error:
                       scissor:scissor
                         width:strokeWidth
                        fringe:fringe
-                    strokeThr:-1.0f];
+                    strokeThr:-1.0f
+                      variant:&call->variant];
   }
 
   return;
@@ -1671,8 +1693,10 @@ error:
                     scissor:scissor
                       width:1.0f
                      fringe:fringe
-                  strokeThr:-1.0f];
+                  strokeThr:-1.0f
+                    variant:&call->variant];
   frag->type = MNVG_SHADER_IMG;
+  call->variant = MNVG_SHADER_IMG * 3 + call->variant % 3;
 
   return;
 
@@ -1836,11 +1860,40 @@ error:
                      vertexCount:call->triangleCount];
 }
 
+// Returns a fragment function specialized for the given shader variant
+// (type * 3 + texType) via function constants, falling back to the
+// unspecialized function on OS versions without MTLFunctionConstantValues.
+- (id<MTLFunction>)fragmentFunctionForVariant:(int)variant {
+  if (@available(macOS 10.12, iOS 10.0, tvOS 10.0, *)) {
+    NSNumber* key = @(variant);
+    id<MTLFunction> function = _fragmentFunctionCache[key];
+    if (function == nil) {
+      int type = variant / 3;
+      int texType = variant % 3;
+      MTLFunctionConstantValues* constantValues = \
+          [MTLFunctionConstantValues new];
+      [constantValues setConstantValue:&type type:MTLDataTypeInt atIndex:0];
+      [constantValues setConstantValue:&texType type:MTLDataTypeInt atIndex:1];
+      NSError* error;
+      function = [_library newFunctionWithName:_fragmentFunction.name
+                                constantValues:constantValues
+                                         error:&error];
+      [self checkError:error withMessage:"init specialized fragment function"];
+      if (function == nil) return _fragmentFunction;
+      _fragmentFunctionCache[key] = function;
+    }
+    return function;
+  }
+  return _fragmentFunction;
+}
+
 - (void)updateRenderPipelineStatesForBlend:(MNVGblend*)blend
-                               pixelFormat:(MTLPixelFormat)pixelFormat {
+                               pixelFormat:(MTLPixelFormat)pixelFormat
+                                   variant:(int)variant {
   if (_pipelineState != nil &&
       _stencilOnlyPipelineState != nil &&
       _piplelinePixelFormat == pixelFormat &&
+      _pipelineVariant == variant &&
       _blendFunc->srcRGB == blend->srcRGB &&
       _blendFunc->dstRGB == blend->dstRGB &&
       _blendFunc->srcAlpha == blend->srcAlpha &&
@@ -1848,65 +1901,75 @@ error:
     return;
   }
 
-  // Checks the pipeline state cache before creating new pipeline states.
-  // MTLBlendFactor values fit in 8 bits and MTLPixelFormat in 32 bits.
-  const uint64_t pipelineKey = ((uint64_t)pixelFormat << 32) |
+  // Checks the pipeline state caches before creating new pipeline states.
+  // MTLBlendFactor values fit in 8 bits, MTLPixelFormat in 16 bits and the
+  // shader variant in the bits above. The stencil-only pipeline state writes
+  // no color, so it depends on neither the blend function nor the shader
+  // variant and is cached by pixel format alone.
+  const uint64_t pipelineKey = ((uint64_t)variant << 48) |
+                               ((uint64_t)pixelFormat << 32) |
                                ((uint64_t)blend->srcRGB << 24) |
                                ((uint64_t)blend->dstRGB << 16) |
                                ((uint64_t)blend->srcAlpha << 8) |
                                ((uint64_t)blend->dstAlpha);
-  MNVGpipelineCacheEntry* cacheEntry = _pipelineCache[@(pipelineKey)];
-  if (cacheEntry != nil) {
-    _pipelineState = cacheEntry->pipelineState;
-    _stencilOnlyPipelineState = cacheEntry->stencilOnlyPipelineState;
-    *_blendFunc = *blend;
-    _piplelinePixelFormat = pixelFormat;
-    return;
+  id<MTLRenderPipelineState> pipelineState = _pipelineCache[@(pipelineKey)];
+  id<MTLRenderPipelineState> stencilOnlyPipelineState = \
+      (_stencilOnlyPipelineState != nil && _piplelinePixelFormat == pixelFormat)
+          ? _stencilOnlyPipelineState
+          : _stencilOnlyPipelineCache[@((uint64_t)pixelFormat)];
+
+  if (pipelineState == nil || stencilOnlyPipelineState == nil) {
+    MTLRenderPipelineDescriptor* pipelineStateDescriptor = \
+        [MTLRenderPipelineDescriptor new];
+
+    MTLRenderPipelineColorAttachmentDescriptor* colorAttachmentDescriptor = \
+        pipelineStateDescriptor.colorAttachments[0];
+    colorAttachmentDescriptor.pixelFormat = pixelFormat;
+    pipelineStateDescriptor.stencilAttachmentPixelFormat = kStencilFormat;
+    pipelineStateDescriptor.vertexFunction = _vertexFunction;
+    pipelineStateDescriptor.vertexDescriptor = _vertexDescriptor;
+
+    NSError* error;
+    if (pipelineState == nil) {
+      pipelineStateDescriptor.fragmentFunction = \
+          [self fragmentFunctionForVariant:variant];
+
+      // Sets blending states.
+      colorAttachmentDescriptor.blendingEnabled = YES;
+      colorAttachmentDescriptor.sourceRGBBlendFactor = blend->srcRGB;
+      colorAttachmentDescriptor.sourceAlphaBlendFactor = blend->srcAlpha;
+      colorAttachmentDescriptor.destinationRGBBlendFactor = blend->dstRGB;
+      colorAttachmentDescriptor.destinationAlphaBlendFactor = blend->dstAlpha;
+
+      pipelineState = [_metalLayer.device
+          newRenderPipelineStateWithDescriptor:pipelineStateDescriptor
+                                         error:&error];
+      [self checkError:error withMessage:"init pipeline state"];
+      if (pipelineState != nil) {
+        _pipelineCache[@(pipelineKey)] = pipelineState;
+      }
+    }
+
+    if (stencilOnlyPipelineState == nil) {
+      pipelineStateDescriptor.fragmentFunction = nil;
+      colorAttachmentDescriptor.blendingEnabled = NO;
+      colorAttachmentDescriptor.writeMask = MTLColorWriteMaskNone;
+      stencilOnlyPipelineState = [_metalLayer.device
+          newRenderPipelineStateWithDescriptor:pipelineStateDescriptor
+                                         error:&error];
+      [self checkError:error withMessage:"init pipeline stencil only state"];
+      if (stencilOnlyPipelineState != nil) {
+        _stencilOnlyPipelineCache[@((uint64_t)pixelFormat)] = \
+            stencilOnlyPipelineState;
+      }
+    }
   }
 
-  MTLRenderPipelineDescriptor* pipelineStateDescriptor = \
-      [MTLRenderPipelineDescriptor new];
-
-  MTLRenderPipelineColorAttachmentDescriptor* colorAttachmentDescriptor = \
-      pipelineStateDescriptor.colorAttachments[0];
-  colorAttachmentDescriptor.pixelFormat = pixelFormat;
-  pipelineStateDescriptor.stencilAttachmentPixelFormat = kStencilFormat;
-  pipelineStateDescriptor.fragmentFunction = _fragmentFunction;
-  pipelineStateDescriptor.vertexFunction = _vertexFunction;
-  pipelineStateDescriptor.vertexDescriptor = _vertexDescriptor;
-
-  // Sets blending states.
-  colorAttachmentDescriptor.blendingEnabled = YES;
-  colorAttachmentDescriptor.sourceRGBBlendFactor = blend->srcRGB;
-  colorAttachmentDescriptor.sourceAlphaBlendFactor = blend->srcAlpha;
-  colorAttachmentDescriptor.destinationRGBBlendFactor = blend->dstRGB;
-  colorAttachmentDescriptor.destinationAlphaBlendFactor = blend->dstAlpha;
-  _blendFunc->srcRGB = blend->srcRGB;
-  _blendFunc->dstRGB = blend->dstRGB;
-  _blendFunc->srcAlpha = blend->srcAlpha;
-  _blendFunc->dstAlpha = blend->dstAlpha;
-
-  NSError* error;
-  _pipelineState = [_metalLayer.device
-      newRenderPipelineStateWithDescriptor:pipelineStateDescriptor
-                                     error:&error];
-  [self checkError:error withMessage:"init pipeline state"];
-
-  pipelineStateDescriptor.fragmentFunction = nil;
-  colorAttachmentDescriptor.writeMask = MTLColorWriteMaskNone;
-  _stencilOnlyPipelineState = [_metalLayer.device
-      newRenderPipelineStateWithDescriptor:pipelineStateDescriptor
-                                     error:&error];
-  [self checkError:error withMessage:"init pipeline stencil only state"];
-
+  _pipelineState = pipelineState;
+  _stencilOnlyPipelineState = stencilOnlyPipelineState;
+  *_blendFunc = *blend;
   _piplelinePixelFormat = pixelFormat;
-
-  if (_pipelineState != nil && _stencilOnlyPipelineState != nil) {
-    cacheEntry = [MNVGpipelineCacheEntry new];
-    cacheEntry->pipelineState = _pipelineState;
-    cacheEntry->stencilOnlyPipelineState = _stencilOnlyPipelineState;
-    _pipelineCache[@(pipelineKey)] = cacheEntry;
-  }
+  _pipelineVariant = variant;
 }
 
 // Re-creates stencil texture whenever the specified size is bigger.
@@ -1945,7 +2008,4 @@ error:
 @end
 
 @implementation MNVGtexture
-@end
-
-@implementation MNVGpipelineCacheEntry
 @end

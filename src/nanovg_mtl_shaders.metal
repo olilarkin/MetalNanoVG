@@ -53,6 +53,16 @@ typedef struct  {
   int type;
 } Uniforms;
 
+// Optional function constants used to specialize the fragment functions per
+// shader type and texture type, turning the per-fragment branching below into
+// compile-time selection. When they are not provided (e.g. on OS versions
+// without MTLFunctionConstantValues), the functions fall back to branching on
+// the uniform values exactly as before.
+constant int typeConst [[function_constant(0)]];
+constant int texTypeConst [[function_constant(1)]];
+constant bool hasTypeConst = is_function_constant_defined(typeConst);
+constant bool hasTexTypeConst = is_function_constant_defined(texTypeConst);
+
 float scissorMask(constant Uniforms& uniforms, float2 p);
 float sdroundrect(constant Uniforms& uniforms, float2 pt);
 float strokeMask(constant Uniforms& uniforms, float2 ftcoord);
@@ -97,30 +107,33 @@ fragment float4 fragmentShader(RasterizerData in [[stage_in]],
                                constant Uniforms& uniforms [[buffer(0)]],
                                texture2d<float> texture [[texture(0)]],
                                sampler sampler [[sampler(0)]]) {
+  const int type = hasTypeConst ? typeConst : uniforms.type;
+  const int texType = hasTexTypeConst ? texTypeConst : uniforms.texType;
+
   float scissor = scissorMask(uniforms, in.fpos);
   if (scissor == 0)
     return float4(0);
 
-  if (uniforms.type == 0) {  // MNVG_SHADER_FILLGRAD
+  if (type == 0) {  // MNVG_SHADER_FILLGRAD
     float2 pt = (uniforms.paintMat * float3(in.fpos, 1.0)).xy;
     float d = saturate((uniforms.feather * 0.5 + sdroundrect(uniforms, pt))
                        / uniforms.feather);
     float4 color = mix(uniforms.innerCol, uniforms.outerCol, d);
     return color * scissor;
-  } else if (uniforms.type == 1) {  // MNVG_SHADER_FILLIMG
+  } else if (type == 1) {  // MNVG_SHADER_FILLIMG
     float2 pt = (uniforms.paintMat * float3(in.fpos, 1.0)).xy / uniforms.extent;
     float4 color = texture.sample(sampler, pt);
-    if (uniforms.texType == 1)
+    if (texType == 1)
       color = float4(color.xyz * color.w, color.w);
-    else if (uniforms.texType == 2)
+    else if (texType == 2)
       color = float4(color.x);
     color *= scissor;
     return color * uniforms.innerCol;
   } else {  // MNVG_SHADER_IMG
     float4 color = texture.sample(sampler, in.ftcoord);
-    if (uniforms.texType == 1)
+    if (texType == 1)
       color = float4(color.xyz * color.w, color.w);
-    else if (uniforms.texType == 2)
+    else if (texType == 2)
       color = float4(color.x);
     color *= scissor;
     return color * uniforms.innerCol;
@@ -132,15 +145,18 @@ fragment float4 fragmentShaderAA(RasterizerData in [[stage_in]],
                                  constant Uniforms& uniforms [[buffer(0)]],
                                  texture2d<float> texture [[texture(0)]],
                                  sampler sampler [[sampler(0)]]) {
+  const int type = hasTypeConst ? typeConst : uniforms.type;
+  const int texType = hasTexTypeConst ? texTypeConst : uniforms.texType;
+
   float scissor = scissorMask(uniforms, in.fpos);
   if (scissor == 0)
     return float4(0);
 
-  if (uniforms.type == 2) {  // MNVG_SHADER_IMG
+  if (type == 2) {  // MNVG_SHADER_IMG
     float4 color = texture.sample(sampler, in.ftcoord);
-    if (uniforms.texType == 1)
+    if (texType == 1)
       color = float4(color.xyz * color.w, color.w);
-    else if (uniforms.texType == 2)
+    else if (texType == 2)
       color = float4(color.x);
     color *= scissor;
     return color * uniforms.innerCol;
@@ -151,7 +167,7 @@ fragment float4 fragmentShaderAA(RasterizerData in [[stage_in]],
     return float4(0);
   }
 
-  if (uniforms.type == 0) {  // MNVG_SHADER_FILLGRAD
+  if (type == 0) {  // MNVG_SHADER_FILLGRAD
     float2 pt = (uniforms.paintMat * float3(in.fpos, 1.0)).xy;
     float d = saturate((uniforms.feather * 0.5 + sdroundrect(uniforms, pt))
                         / uniforms.feather);
@@ -162,9 +178,9 @@ fragment float4 fragmentShaderAA(RasterizerData in [[stage_in]],
   } else {  // MNVG_SHADER_FILLIMG
     float2 pt = (uniforms.paintMat * float3(in.fpos, 1.0)).xy / uniforms.extent;
     float4 color = texture.sample(sampler, pt);
-    if (uniforms.texType == 1)
+    if (texType == 1)
       color = float4(color.xyz * color.w, color.w);
-    else if (uniforms.texType == 2)
+    else if (texType == 2)
       color = float4(color.x);
     color *= scissor;
     color *= strokeAlpha;
